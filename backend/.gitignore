@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+listings.db
+listings.db-wal
+listings.db-shm
+.env

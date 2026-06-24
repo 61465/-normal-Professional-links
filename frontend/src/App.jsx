@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
-import { fetchListings, checkHealth } from './services/api';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { fetchListings, checkHealth, triggerRefresh } from './services/api';
 import { analyzeDeal } from './services/aiAnalyzer';
 import { SEARCH_PORTALS } from './data/portals';
 import DealCard from './components/DealCard';
@@ -50,13 +50,18 @@ export default function App() {
 
   const [aiTarget, setAiTarget] = useState(null);
   const [viewUrl, setViewUrl] = useState(null);
+  const [dbTotal, setDbTotal] = useState(0);
+  const [lastScrape, setLastScrape] = useState(null);
+  const [newCount, setNewCount] = useState(0);
+  const [scraping, setScraping] = useState(false);
+  const knownIdsRef = useRef(new Set());
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 500);
     return () => window.clearTimeout(timer);
   }, [search]);
 
-  const loadListings = useCallback(async () => {
+  const loadListings = useCallback(async ({ silent = false } = {}) => {
     if (PROTECTED_SOURCES.includes(source)) {
       setListings([]);
       setError(null);
@@ -64,12 +69,12 @@ export default function App() {
       return;
     }
 
-    setLoading(true);
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const healthy = await checkHealth();
       if (!healthy) {
-        setListings([]);
+        if (!silent) setListings([]);
         setError('backend_down');
         return;
       }
@@ -80,29 +85,88 @@ export default function App() {
         condition,
         source,
       });
-      setListings(data);
+
+      // كشف الجديد منذ آخر تحميل
+      if (knownIdsRef.current.size > 0) {
+        const newcomers = data.listings.filter(l => !knownIdsRef.current.has(l.id));
+        if (newcomers.length > 0 && silent) {
+          setNewCount(prev => prev + newcomers.length);
+        }
+      }
+      knownIdsRef.current = new Set(data.listings.map(l => l.id));
+
+      setListings(data.listings);
+      setDbTotal(data.dbTotal);
+      setLastScrape(data.lastScrape);
     } catch (e) {
       setError('fetch_error');
-      setListings([]);
+      if (!silent) setListings([]);
       console.error(e);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [debouncedSearch, category, condition, source, refreshKey]);
 
   useEffect(() => { loadListings(); }, [loadListings]);
 
+  // 🔄 Auto-refresh كل 60 ثانية (silent — لا يكسر الـ UI)
+  useEffect(() => {
+    const id = window.setInterval(() => loadListings({ silent: true }), 60000);
+    return () => window.clearInterval(id);
+  }, [loadListings]);
+
+  // 🚀 Force backend scrape
+  const handleForceRefresh = useCallback(async () => {
+    setScraping(true);
+    try {
+      await triggerRefresh();
+      setNewCount(0);
+      await loadListings();
+    } catch (e) {
+      console.error('refresh failed', e);
+    } finally {
+      setScraping(false);
+    }
+  }, [loadListings]);
+
+  // عرض الإعلانات الجديدة (يصفّر العداد)
+  const handleShowNew = useCallback(() => {
+    setNewCount(0);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, []);
+
   const sortedListings = useMemo(() => {
     const list = [...listings];
     switch (sortBy) {
       case 'hot':
-        list.sort((a, b) => Number(b.hot) - Number(a.hot));
+        list.sort((a, b) => {
+          // hot أولاً، ثم الأرخص داخل كل مجموعة
+          const h = Number(b.hot) - Number(a.hot);
+          if (h !== 0) return h;
+          return (a.price ?? Infinity) - (b.price ?? Infinity);
+        });
         break;
       case 'price_asc':
-        list.sort((a, b) => (a.price || 999999) - (b.price || 999999));
+        // الأرخص أولاً، عناصر بدون سعر في النهاية
+        list.sort((a, b) => {
+          const ap = a.price ?? Infinity;
+          const bp = b.price ?? Infinity;
+          return ap - bp;
+        });
         break;
       case 'price_desc':
-        list.sort((a, b) => (b.price || 0) - (a.price || 0));
+        // الأغلى أولاً، عناصر بدون سعر في النهاية
+        list.sort((a, b) => {
+          const ap = a.price ?? -Infinity;
+          const bp = b.price ?? -Infinity;
+          if (a.price == null && b.price != null) return 1;
+          if (b.price == null && a.price != null) return -1;
+          return bp - ap;
+        });
+        break;
+      case 'newest':
+        // إعلانات Craigslist بدون timestamp دقيق؛ نضع الـ id كـ proxy عشوائي
+        list.sort((a, b) => (b.id || '').localeCompare(a.id || ''));
         break;
       default:
         break;
@@ -129,6 +193,14 @@ export default function App() {
   const handleAI = (listing) => setAiTarget({ listing, analysis: analyzeDeal(listing) });
   const handleUrl = (url, label) => setViewUrl({ url, label });
   const refreshListings = () => setRefreshKey(k => k + 1);
+
+  const lastScrapeText = useMemo(() => {
+    if (!lastScrape) return null;
+    const delta = Math.floor((Date.now() - new Date(lastScrape).getTime()) / 1000);
+    if (delta < 60) return 'الآن';
+    if (delta < 3600) return `قبل ${Math.floor(delta / 60)} د`;
+    return `قبل ${Math.floor(delta / 3600)} س`;
+  }, [lastScrape]);
 
   if (loading) return (
     <>
@@ -193,13 +265,27 @@ export default function App() {
               <h2 className="section-title">📡 إعلانات مباشرة</h2>
               <div className="feed-meta">
                 <span className="feed-count">
-                  <strong>{sortedListings.length}</strong> إعلان حقيقي
+                  <strong>{sortedListings.length}</strong> من <strong>{dbTotal}</strong>
                 </span>
-                <button className="btn-refresh" onClick={refreshListings} title="تحديث">
-                  🔄
+                {lastScrapeText && (
+                  <span className="last-scrape">🕒 آخر جمع: {lastScrapeText}</span>
+                )}
+                <button
+                  className="btn-refresh"
+                  onClick={handleForceRefresh}
+                  disabled={scraping}
+                  title={scraping ? 'جاري الجمع…' : 'جلب جديد الآن'}
+                >
+                  {scraping ? '⏳' : '🔄'}
                 </button>
               </div>
             </div>
+
+            {newCount > 0 && (
+              <button className="new-deals-banner" onClick={handleShowNew}>
+                ✨ {newCount} عرض جديد — اضغط للعرض
+              </button>
+            )}
 
             {sortedListings.length === 0 ? (
               <div className="empty-state">

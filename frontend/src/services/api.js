@@ -3,18 +3,30 @@
 // VITE_API_BASE if the API is hosted on another origin.
 const API_BASE = import.meta.env.VITE_API_BASE || "";
 
-/**
- * يجلب إعلانات حقيقية من الـ backend (Craigslist + eBay RSS)
- * عند الفشل يعيد مصفوفة فارغة بدلاً من كسر التطبيق
- */
-export async function fetchListings({ q = "", category = "all", condition = "all", source = "all" } = {}) {
-  const params = new URLSearchParams({ q, category, condition, source });
+/** يجلب الإعلانات من الـ DB المحلية في الـ backend (سريع، مفلتر، حتى 500) */
+export async function fetchListings({ q = "", category = "all", condition = "all", source = "all", limit = 500 } = {}) {
+  const params = new URLSearchParams({ q, category, condition, source, limit });
   const res = await fetch(`${API_BASE}/api/listings?${params}`, {
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json();
-  return data.listings || [];
+  return {
+    listings:    data.listings || [],
+    dbTotal:     data.db_total || 0,
+    lastScrape:  data.last_scrape,
+    fetchedAt:   data.fetched_at,
+  };
+}
+
+/** يُجبر الـ backend على scrape فوري ويرجع الإحصائيات */
+export async function triggerRefresh() {
+  const res = await fetch(`${API_BASE}/api/refresh`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(120000), // scrape كامل قد يأخذ دقيقة
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
 
 /** فحص إذا كان الـ backend يعمل */

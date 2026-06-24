@@ -1,23 +1,29 @@
 """
-MobeFace Backend — Real Listings Aggregator
-يجلب إعلانات حقيقية من eBay (RSS) وCraigslist (HTML scraping مع تحايل)
+MobeFace Backend — Live Tech Deals Aggregator
+يجمع باستمرار من Craigslist (متعدد المدن) + eBay RSS ويخزّن في SQLite،
+ثم يخدم الفلاتر من الـ DB (سريع جداً، بدون اعتماد على المصادر الخارجية وقت الطلب).
 """
+from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
-import json
-import time
-from urllib.parse import urljoin
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import feedparser
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+from storage import (
+    init_db, upsert_many, query_listings, cleanup_old, stats, count_listings,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -25,23 +31,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("mobeface")
 
-app = FastAPI(title="MobeFace API", version="1.1.0")
-
 ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
     if o.strip()
 ]
+SCRAPE_INTERVAL = int(os.getenv("SCRAPE_INTERVAL_SECONDS", "600"))  # 10 min
+SCRAPE_ON_STARTUP = os.getenv("SCRAPE_ON_STARTUP", "1") == "1"
 
+app = FastAPI(title="MobeFace API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
-
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))
-_cache: dict[str, tuple[float, dict]] = {}
-_cache_lock = asyncio.Lock()
 
 # ── Headers تحاكي متصفح حقيقي ─────────────────────────────────────────────
 BROWSER_HEADERS = {
@@ -56,59 +59,45 @@ BROWSER_HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
-
 FEED_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
+    **BROWSER_HEADERS,
     "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
 }
+TIMEOUT = 20.0
 
-TIMEOUT = 15.0
+# ── مدن Craigslist (الأقرب لـ Springfield 01119) ──────────────────────────
+CRAIGSLIST_CITIES = ["springfield", "westernmass", "hartford", "boston", "providence"]
 
-# ── استعلامات البحث ────────────────────────────────────────────────────────
+# ── استعلامات شاملة ──────────────────────────────────────────────────────
 EBAY_QUERIES = [
-    ("iphone used unlocked",        "moa"),
-    ("samsung galaxy used",          "moa"),
-    ("google pixel used",            "moa"),
-    ("ps5 console",                  "vgm"),
-    ("xbox series x",                "vgm"),
-    ("nintendo switch oled",         "vgm"),
-    ("ipad air used",                "tab"),
-    ("macbook air used",             "sys"),
-    ("oneplus phone used",           "moa"),
-    ("motorola unlocked",            "moa"),
+    "iphone used unlocked", "iphone for parts", "iphone 13", "iphone 14", "iphone 15",
+    "samsung galaxy used", "samsung galaxy broken", "samsung s23", "samsung s24",
+    "google pixel used", "pixel 7", "pixel 8",
+    "oneplus phone used", "motorola unlocked", "xiaomi phone",
+    "ps5 console", "ps5 slim", "ps4 pro",
+    "xbox series x", "xbox series s", "xbox one",
+    "nintendo switch oled", "nintendo switch lite", "switch console",
+    "steam deck", "rog ally",
+    "ipad air used", "ipad pro used", "samsung tab",
+    "macbook air used", "macbook pro used", "dell xps", "thinkpad",
+    "airpods pro", "apple watch used", "galaxy watch",
 ]
 
-CRAIGSLIST_SEARCHES = [
-    ("moa", "iphone"),
-    ("moa", "samsung"),
-    ("vgm", "ps5"),
-    ("vgm", "xbox"),
-    ("vgm", "switch"),
-    ("moa", "ipad"),
-    ("sys", "macbook"),
-    ("moa", "pixel"),
+CRAIGSLIST_QUERIES = [
+    ("moa", "iphone"), ("moa", "samsung"), ("moa", "pixel"), ("moa", "oneplus"),
+    ("moa", "ipad"), ("moa", "android"), ("moa", "phone"),
+    ("vgm", "ps5"), ("vgm", "ps4"), ("vgm", "xbox"), ("vgm", "switch"),
+    ("vgm", "steam deck"), ("vgm", "console"),
+    ("sys", "macbook"), ("sys", "laptop"), ("sys", "thinkpad"),
+    ("ela", "airpods"), ("ela", "apple watch"), ("ela", "earbuds"),
 ]
 
-CRAIGSLIST_CATS_BY_CATEGORY = {
-    "phone": ["moa"],
-    "gaming": ["vgm"],
-    "tablet": ["moa", "sys"],
-    "laptop": ["sys"],
-    "accessories": ["moa", "ela"],
-    "all": ["moa", "vgm", "sys"],
-}
-# ── تصنيف تلقائي ───────────────────────────────────────────────────────────
 CATEGORY_RULES = {
     "phone":      ["iphone", "samsung", "galaxy", "pixel", "motorola", "oneplus", "xiaomi", "phone", "android"],
-    "gaming":     ["ps5", "ps4", "xbox", "nintendo", "switch", "playstation", "quest", "gaming", "console"],
-    "tablet":     ["ipad", "tab", "tablet"],
-    "laptop":     ["macbook", "laptop", "dell", "hp ", "lenovo", "thinkpad"],
-    "accessories":["airpods", "watch", "earbud", "headphone"],
+    "gaming":     ["ps5", "ps4", "xbox", "nintendo", "switch", "playstation", "quest", "gaming", "console", "steam deck", "rog ally"],
+    "tablet":     ["ipad", "tab ", "tablet"],
+    "laptop":     ["macbook", "laptop", "dell", "hp ", "lenovo", "thinkpad", "xps"],
+    "accessories":["airpods", "watch", "earbud", "headphone", "galaxy watch"],
 }
 
 PARTS_KEYWORDS = [
@@ -172,29 +161,11 @@ def extract_price(text: str) -> int | None:
 
 
 def make_id(prefix: str, url: str) -> str:
-    return f"{prefix}-{hashlib.md5(url.encode()).hexdigest()[:8]}"
-
-
-def time_ago(published) -> str:
-    try:
-        if published and hasattr(published, "tm_hour"):
-            pub = datetime(*published[:6], tzinfo=timezone.utc)
-            delta = datetime.now(timezone.utc) - pub
-            hours = int(delta.total_seconds() // 3600)
-            if hours < 1:
-                m = max(1, int(delta.total_seconds() // 60))
-                return f"{m}m"
-            if hours < 24:
-                return f"{hours}h"
-            return f"{delta.days}d"
-    except Exception:
-        pass
-    return "recently"
+    return f"{prefix}-{hashlib.md5(url.encode()).hexdigest()[:10]}"
 
 
 # ── eBay RSS Scraper ────────────────────────────────────────────────────────
 async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
-    """يجلب من eBay RSS — مجاني وموثوق"""
     url = (
         f"https://www.ebay.com/sch/i.html"
         f"?_nkw={query.replace(' ', '+')}"
@@ -206,12 +177,11 @@ async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
         if r.status_code != 200:
             return []
         feed = feedparser.parse(r.text)
-        for entry in feed.entries[:8]:
+        for entry in feed.entries[:30]:
             title   = (entry.get("title") or "").strip()
             link    = entry.get("link", "")
             summary = entry.get("summary") or entry.get("description") or ""
 
-            # استخراج السعر من العنوان أو الملخص
             price = extract_price(title) or extract_price(summary)
             if not title or not link:
                 continue
@@ -222,7 +192,6 @@ async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
             cond  = detect_condition(title + " " + summary)
             fault = detect_fault(title + " " + summary)
 
-            # استخراج الصورة من الـ HTML المضمّن في summary
             img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', summary)
             image = img_match.group(1) if img_match else CATEGORY_IMAGES.get(cat, CATEGORY_IMAGES["other"])
 
@@ -238,7 +207,6 @@ async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
                 "image":       image,
                 "url":         link,
                 "fault":       fault,
-                "postedAgo":   time_ago(entry.get("published_parsed")),
                 "city":        "Ships to 01119",
                 "hot":         bool(price and price < 300 and cond == "working"),
             })
@@ -247,21 +215,17 @@ async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
     return results
 
 
-# ── Craigslist HTML Scraper ─────────────────────────────────────────────────
-async def fetch_craigslist_html(client: httpx.AsyncClient, cat: str, query: str) -> list[dict]:
-    """يجلب نتائج Craigslist الحقيقية ويرجع رابط الإعلان الفردي لا رابط البحث."""
+# ── Craigslist HTML Scraper (متعدد المدن) ─────────────────────────────────
+async def fetch_craigslist(client: httpx.AsyncClient, city: str, cat: str, query: str) -> list[dict]:
     url = (
-        f"https://springfield.craigslist.org/search/{cat}"
-        f"?query={query.replace(' ', '+')}&postal=01119&search_distance=20"
+        f"https://{city}.craigslist.org/search/{cat}"
+        f"?query={query.replace(' ', '+')}&postal=01119&search_distance=50"
     )
     results = []
     try:
         r = await client.get(url, headers=BROWSER_HEADERS, timeout=TIMEOUT, follow_redirects=True)
-        if r.status_code != 200 or "blocked" in r.text.lower():
-            url2 = f"https://springfield.craigslist.org/search/{cat}?query={query.replace(' ', '+')}"
-            r = await client.get(url2, headers=BROWSER_HEADERS, timeout=TIMEOUT, follow_redirects=True)
-            if r.status_code != 200:
-                return []
+        if r.status_code != 200:
+            return []
 
         soup = BeautifulSoup(r.text, "lxml")
         items = (
@@ -278,7 +242,7 @@ async def fetch_craigslist_html(client: httpx.AsyncClient, cat: str, query: str)
             except Exception:
                 schema_items = []
 
-        for idx, item in enumerate(items[:12]):
+        for idx, item in enumerate(items[:50]):
             schema_item = schema_items[idx].get("item", {}) if idx < len(schema_items) else {}
 
             title_el = (
@@ -296,7 +260,13 @@ async def fetch_craigslist_html(client: httpx.AsyncClient, cat: str, query: str)
             price_el = item.select_one("span.priceinfo") or item.select_one("span.result-price") or item.select_one(".price")
             price_text = price_el.get_text(strip=True) if price_el else ""
             schema_price = schema_item.get("offers", {}).get("price")
-            price = extract_price(price_text) or extract_price(f"${schema_price}" if schema_price else "") or extract_price(title)
+            # السعر الصريح فقط — لا fallback من العنوان
+            price = extract_price(price_text)
+            if not price and schema_price:
+                try:
+                    price = int(float(schema_price))
+                except (TypeError, ValueError):
+                    price = None
 
             img_el = item.select_one("img")
             image = img_el.get("src") or img_el.get("data-src") if img_el else None
@@ -317,7 +287,7 @@ async def fetch_craigslist_html(client: httpx.AsyncClient, cat: str, query: str)
             cond = detect_condition(title)
             fault = detect_fault(title)
             address = schema_item.get("offers", {}).get("availableAtOrFrom", {}).get("address", {})
-            city = address.get("addressLocality") or "Springfield"
+            city_name = address.get("addressLocality") or city.title()
 
             results.append({
                 "id":          make_id("cl", link),
@@ -331,109 +301,164 @@ async def fetch_craigslist_html(client: httpx.AsyncClient, cat: str, query: str)
                 "image":       image,
                 "url":         link,
                 "fault":       fault,
-                "postedAgo":   "recently",
-                "city":        f"{city}, MA",
+                "city":        f"{city_name}, {('MA' if city in ('springfield','westernmass','boston') else 'CT' if city=='hartford' else 'RI')}",
                 "hot":         bool(price and price < 250 and cond == "working"),
             })
     except Exception as e:
-        log.warning("Craigslist '%s/%s' failed: %s", cat, query, e)
+        log.warning("Craigslist '%s/%s/%s' failed: %s", city, cat, query, e)
     return results
 
-# ── API Endpoints ────────────────────────────────────────────────────────────
+
+# ── Master Scraper ──────────────────────────────────────────────────────────
+async def run_full_scrape() -> dict:
+    """يجلب كل شيء من جميع المصادر، يخزّن في DB، يرجع stats."""
+    started = asyncio.get_event_loop().time()
+    log.info("Starting full scrape …")
+
+    all_items: list[dict] = []
+    sem = asyncio.Semaphore(6)  # cap concurrency to be polite
+
+    async def bounded(coro):
+        async with sem:
+            return await coro
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=5.0)) as client:
+        tasks = []
+        # eBay
+        for q in EBAY_QUERIES:
+            tasks.append(bounded(fetch_ebay_rss(client, q)))
+        # Craigslist × كل مدينة
+        for city in CRAIGSLIST_CITIES:
+            for cat, query in CRAIGSLIST_QUERIES:
+                tasks.append(bounded(fetch_craigslist(client, city, cat, query)))
+
+        batches = await asyncio.gather(*tasks, return_exceptions=True)
+        for batch in batches:
+            if isinstance(batch, Exception):
+                continue
+            all_items.extend(batch)
+
+    # dedup by id (نفس الرابط من نفس المصدر)
+    seen = {}
+    for it in all_items:
+        seen[it["id"]] = it
+    unique = list(seen.values())
+
+    added, updated = upsert_many(unique)
+    deleted = cleanup_old(max_age_days=7, max_total=1000)
+    elapsed = asyncio.get_event_loop().time() - started
+    total = count_listings()
+    log.info(
+        "Scrape done in %.1fs: fetched=%d unique=%d added=%d updated=%d deleted=%d total=%d",
+        elapsed, len(all_items), len(unique), added, updated, deleted, total,
+    )
+    return {
+        "fetched":  len(all_items),
+        "unique":   len(unique),
+        "added":    added,
+        "updated":  updated,
+        "deleted":  deleted,
+        "total":    total,
+        "elapsed":  round(elapsed, 2),
+    }
+
+
+# ── Background Loop ─────────────────────────────────────────────────────────
+_scrape_task: asyncio.Task | None = None
+_last_scrape_result: dict | None = None
+_scrape_lock = asyncio.Lock()
+
+
+async def scrape_loop():
+    global _last_scrape_result
+    if SCRAPE_ON_STARTUP:
+        try:
+            async with _scrape_lock:
+                _last_scrape_result = await run_full_scrape()
+        except Exception as e:
+            log.exception("Initial scrape failed: %s", e)
+
+    while True:
+        await asyncio.sleep(SCRAPE_INTERVAL)
+        try:
+            async with _scrape_lock:
+                _last_scrape_result = await run_full_scrape()
+        except Exception as e:
+            log.exception("Scheduled scrape failed: %s", e)
+
+
+@app.on_event("startup")
+async def _startup():
+    init_db()
+    global _scrape_task
+    _scrape_task = asyncio.create_task(scrape_loop())
+    log.info("MobeFace startup complete — scrape every %ds, %d listings in DB",
+             SCRAPE_INTERVAL, count_listings())
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if _scrape_task:
+        _scrape_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _scrape_task
+
+
+# ── API Endpoints ───────────────────────────────────────────────────────────
 @app.get("/api/listings")
 async def get_listings(
-    response:  Response,
     q:         str = Query(default=""),
     category:  str = Query(default="all"),
     condition: str = Query(default="all"),
     source:    str = Query(default="all"),
+    limit:     int = Query(default=500, ge=1, le=2000),
 ):
-    search_term = q.strip()
-    cache_key = f"{search_term}|{category}|{condition}|{source}"
-    now = time.time()
-
-    async with _cache_lock:
-        cached = _cache.get(cache_key)
-        if cached and now - cached[0] < CACHE_TTL:
-            response.headers["Cache-Control"] = f"public, max-age={CACHE_TTL}"
-            response.headers["X-Cache"] = "HIT"
-            return cached[1]
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=5.0)) as client:
-        tasks = []
-
-        # eBay RSS — استخدم بحث المستخدم عند توفره، وإلا استخدم البحث الافتراضي
-        if source in ("all", "ebay"):
-            ebay_queries = [(search_term, category)] if search_term else EBAY_QUERIES
-            for query, _ in ebay_queries:
-                tasks.append(fetch_ebay_rss(client, query))
-
-        # Craigslist HTML — بحث حقيقي حسب كلمة المستخدم والتصنيف
-        if source in ("all", "craigslist"):
-            if search_term:
-                cats = CRAIGSLIST_CATS_BY_CATEGORY.get(category, CRAIGSLIST_CATS_BY_CATEGORY["all"])
-                for cat in cats:
-                    tasks.append(fetch_craigslist_html(client, cat, search_term))
-            else:
-                searches = [
-                    (cat, query) for cat, query in CRAIGSLIST_SEARCHES
-                    if category == "all" or detect_category(query) == category or cat in CRAIGSLIST_CATS_BY_CATEGORY.get(category, [])
-                ]
-                for cat, query in searches:
-                    tasks.append(fetch_craigslist_html(client, cat, query))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # دمج وإزالة التكرار
-    seen = set()
-    listings = []
-    for batch in results:
-        if isinstance(batch, Exception):
-            continue
-        for item in batch:
-            key = item["id"]
-            if key not in seen:
-                seen.add(key)
-                listings.append(item)
-
-    # فلترة
-    if search_term:
-        ql = search_term.lower()
-        listings = [l for l in listings if ql in (l["title"] or "").lower()]
-    if category != "all":
-        listings = [l for l in listings if l["category"] == category]
-    if condition != "all":
-        listings = [l for l in listings if l["condition"] == condition]
-
-    # ترتيب: hot أولاً ثم السعر
-    listings.sort(key=lambda x: (not x["hot"], x.get("price") or 9999))
-
-    payload = {
-        "total":      len(listings),
-        "listings":   listings,
-        "sources":    ["ebay", "craigslist"],
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+    listings = query_listings(
+        q=q.strip(), category=category, condition=condition, source=source, limit=limit,
+    )
+    s = stats()
+    return {
+        "total":       len(listings),
+        "listings":    listings,
+        "sources":     ["ebay", "craigslist"],
+        "fetched_at":  datetime.now(timezone.utc).isoformat(),
+        "db_total":    s["total"],
+        "last_scrape": (
+            datetime.fromtimestamp(s["last_scrape"], tz=timezone.utc).isoformat()
+            if s["last_scrape"] else None
+        ),
     }
 
-    async with _cache_lock:
-        _cache[cache_key] = (now, payload)
-        if len(_cache) > 200:
-            oldest = min(_cache, key=lambda k: _cache[k][0])
-            _cache.pop(oldest, None)
 
-    response.headers["Cache-Control"] = f"public, max-age={CACHE_TTL}"
-    response.headers["X-Cache"] = "MISS"
-    return payload
+@app.get("/api/stats")
+async def get_stats():
+    s = stats()
+    return {
+        **s,
+        "last_scrape_iso": (
+            datetime.fromtimestamp(s["last_scrape"], tz=timezone.utc).isoformat()
+            if s["last_scrape"] else None
+        ),
+        "last_run": _last_scrape_result,
+        "scrape_interval_sec": SCRAPE_INTERVAL,
+    }
+
+
+@app.post("/api/refresh")
+async def trigger_refresh():
+    """يطلق scrape فوري (يستخدمه زر Refresh في الواجهة)."""
+    if _scrape_lock.locked():
+        return {"status": "already_running"}
+    async with _scrape_lock:
+        result = await run_full_scrape()
+    return {"status": "ok", **result}
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "message": "MobeFace API running"}
+    return {"status": "ok", "message": "MobeFace API running", "db_total": count_listings()}
 
 
 @app.get("/")
 async def root():
-    return {"name": "MobeFace API", "docs": "/docs"}
-
-
-
+    return {"name": "MobeFace API", "version": "2.0.0", "docs": "/docs"}

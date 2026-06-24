@@ -20,8 +20,9 @@ export default function DealCard({ listing, onAIAnalyze, onOpenUrl }) {
       className={`deal-card ${listing.hot ? 'hot-deal' : ''}`}
       aria-label={listing.title}
     >
-      {/* Hot badge */}
-      {listing.hot && <div className="hot-badge">🔥 Hot</div>}
+      {/* Hot / New badges */}
+      {listing.isNew && <div className="new-badge">✨ جديد</div>}
+      {listing.hot && !listing.isNew && <div className="hot-badge">🔥 Hot</div>}
 
       {/* AI Score badge */}
       <div

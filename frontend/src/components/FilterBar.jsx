@@ -68,7 +68,7 @@ export default function FilterBar({
           <span className="filter-label">ترتيب:</span>
           <select
             id="sort-select"
-            className="sort-select"
+            className={`sort-select ${sortBy !== 'hot' ? 'active' : ''}`}
             value={sortBy}
             onChange={e => onSort(e.target.value)}
           >
