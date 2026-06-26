@@ -92,13 +92,28 @@ CRAIGSLIST_QUERIES = [
     ("ela", "airpods"), ("ela", "apple watch"), ("ela", "earbuds"),
 ]
 
+ACCESSORY_KEYWORDS = [
+    "case", "cover", "screen protector", "charger", "cable", "adapter",
+    "stand", "holder", "mount", "wallet", "skin", "sleeve", "pouch",
+    "lanyard", "stylus", "pen", "lens kit", "ring", "magsafe", "popsocket",
+    "service", "sim card", "esim", "unlock service", "plan", "subscription",
+]
+
 CATEGORY_RULES = {
+    # الأكسسوارات يجب فحصها أولاً قبل أي شيء آخر
+    "accessories":["airpods", "earbud", "headphone", "watch", "galaxy watch",
+                   *ACCESSORY_KEYWORDS],
     "phone":      ["iphone", "samsung", "galaxy", "pixel", "motorola", "oneplus", "xiaomi", "phone", "android"],
-    "gaming":     ["ps5", "ps4", "xbox", "nintendo", "switch", "playstation", "quest", "gaming", "console", "steam deck", "rog ally"],
+    "gaming":     ["ps5", "ps4", "xbox", "nintendo", "switch", "playstation", "quest", "gaming", "console", "steam deck", "rog ally", "controller"],
     "tablet":     ["ipad", "tab ", "tablet"],
     "laptop":     ["macbook", "laptop", "dell", "hp ", "lenovo", "thinkpad", "xps"],
-    "accessories":["airpods", "watch", "earbud", "headphone", "galaxy watch"],
 }
+
+# عناصر يجب تجاهلها تماماً (ليست أجهزة ولا أكسسوارات حقيقية)
+JUNK_KEYWORDS = [
+    "sim card", "esim", "mint mobile", "unlimited service", "plan service",
+    "wanted", "iso ", "looking for", "trade for", "free ",
+]
 
 PARTS_KEYWORDS = [
     "broken", "cracked", "parts", "for parts", "bad esn", "icloud",
@@ -135,6 +150,12 @@ def detect_category(text: str) -> str:
         if any(k in t for k in kws):
             return cat
     return "other"
+
+
+def is_junk(text: str) -> bool:
+    """True إذا الإعلان غير مرغوب (خدمة، wanted, trade)."""
+    t = text.lower()
+    return any(j in t for j in JUNK_KEYWORDS)
 
 
 def detect_condition(text: str) -> str:
@@ -183,7 +204,7 @@ async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
             summary = entry.get("summary") or entry.get("description") or ""
 
             price = extract_price(title) or extract_price(summary)
-            if not title or not link:
+            if not title or not link or is_junk(title):
                 continue
             if price and (price < 5 or price > 4000):
                 continue
@@ -278,7 +299,7 @@ async def fetch_craigslist(client: httpx.AsyncClient, city: str, cat: str, query
             if not image or "placeholder" in (image or ""):
                 image = CATEGORY_IMAGES.get(detect_category(title), CATEGORY_IMAGES["other"])
 
-            if not title or not link:
+            if not title or not link or is_junk(title):
                 continue
             if price and (price < 5 or price > 4000):
                 continue
