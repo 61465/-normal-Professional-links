@@ -115,6 +115,18 @@ JUNK_KEYWORDS = [
     "wanted", "iso ", "looking for", "trade for", "free ",
 ]
 
+# حدود سعر منطقية لكل فئة (من NEXUS data_pipeline)
+PRICE_RANGES = {
+    "phone":       (20,  1500),
+    "gaming":      (10,  2000),
+    "tablet":      (50,  1200),
+    "laptop":      (100, 3000),
+    "accessories": (5,    500),
+    "other":       (5,   1500),
+}
+
+MIN_TITLE_LEN = 12  # عناوين قصيرة جداً = "For sale" بدون قيمة
+
 PARTS_KEYWORDS = [
     "broken", "cracked", "parts", "for parts", "bad esn", "icloud",
     "locked", "bent", "water damage", "won't turn", "does not turn",
@@ -156,6 +168,54 @@ def is_junk(text: str) -> bool:
     """True إذا الإعلان غير مرغوب (خدمة، wanted, trade)."""
     t = text.lower()
     return any(j in t for j in JUNK_KEYWORDS)
+
+
+def is_valid_price_for_category(price: int | None, category: str) -> bool:
+    """يتحقق من السعر ضمن النطاق المنطقي للفئة. None = مرفوض."""
+    if price is None:
+        return False
+    lo, hi = PRICE_RANGES.get(category, PRICE_RANGES["other"])
+    return lo <= price <= hi
+
+
+# ── Fuzzy dedup (من NEXUS algorithm_expert) ───────────────────────────────
+import re as _re_dd
+from difflib import SequenceMatcher as _SM
+from string import punctuation as _PUNCT
+
+_STOPWORDS = {'and', 'or', 'for', 'with', 'the', 'a', 'an', 'in', 'on', 'at', 'to'}
+
+
+def _normalize_title(title: str) -> str:
+    t = title.lower()
+    t = _re_dd.sub(f'[{_re_dd.escape(_PUNCT)}]', '', t)
+    return ' '.join(w for w in t.split() if w not in _STOPWORDS and len(w) > 1)
+
+
+def dedupe_items(items: list[dict]) -> list[dict]:
+    """يزيل التكرار الـ fuzzy: نفس source + سعر ±$5 + title similarity > 0.85."""
+    drop: set[str] = set()
+    n = len(items)
+    # ترتيب حسب طول العنوان (نُبقي الأكثر تفصيلاً)
+    items_sorted = sorted(items, key=lambda x: -len(x.get("title", "")))
+    norms = [_normalize_title(it["title"]) for it in items_sorted]
+    for i in range(n):
+        if items_sorted[i]["id"] in drop:
+            continue
+        for j in range(i + 1, n):
+            if items_sorted[j]["id"] in drop:
+                continue
+            a, b = items_sorted[i], items_sorted[j]
+            if a["source"] != b["source"]:
+                continue
+            pa, pb = a.get("price"), b.get("price")
+            if pa is None or pb is None:
+                continue
+            if abs(pa - pb) > 5:
+                continue
+            if _SM(None, norms[i], norms[j]).ratio() > 0.85:
+                drop.add(b["id"])
+    return [it for it in items if it["id"] not in drop]
 
 
 def detect_condition(text: str) -> str:
@@ -206,7 +266,7 @@ async def fetch_ebay_rss(client: httpx.AsyncClient, query: str) -> list[dict]:
             price = extract_price(title) or extract_price(summary)
             if not title or not link or is_junk(title):
                 continue
-            if price and (price < 5 or price > 4000):
+            if len(title) < MIN_TITLE_LEN:
                 continue
 
             cat   = detect_category(title)
@@ -301,7 +361,7 @@ async def fetch_craigslist(client: httpx.AsyncClient, city: str, cat: str, query
 
             if not title or not link or is_junk(title):
                 continue
-            if price and (price < 5 or price > 4000):
+            if len(title) < MIN_TITLE_LEN:
                 continue
 
             cat_ = detect_category(title)
@@ -359,11 +419,20 @@ async def run_full_scrape() -> dict:
                 continue
             all_items.extend(batch)
 
-    # dedup by id (نفس الرابط من نفس المصدر)
-    seen = {}
-    for it in all_items:
+    # 1) فلتر السعر حسب الفئة (إعلانات بدون سعر تُسقَط)
+    valid = [it for it in all_items if is_valid_price_for_category(it.get("price"), it.get("category", "other"))]
+
+    # 2) dedup بـ id أولاً (نفس الرابط)
+    seen: dict[str, dict] = {}
+    for it in valid:
         seen[it["id"]] = it
-    unique = list(seen.values())
+    by_id = list(seen.values())
+
+    # 3) fuzzy dedup عبر المدن (نفس البائع كرر نفس الإعلان)
+    unique = dedupe_items(by_id)
+
+    log.info("Filter: raw=%d valid_price=%d unique_id=%d unique_fuzzy=%d",
+             len(all_items), len(valid), len(by_id), len(unique))
 
     added, updated = upsert_many(unique)
     deleted = cleanup_old(max_age_days=7, max_total=1000)
